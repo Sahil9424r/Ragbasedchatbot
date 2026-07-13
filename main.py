@@ -35,17 +35,21 @@ from app.state import app_state
 # ─────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load heavy resources ONCE at server startup — before any user hits the API."""
-    print("🚀 Loading embedding model at startup...")
-    app_state.load_embeddings()          # ~90MB HuggingFace model — cached globally
-    print("✅ Embedding model ready. Server is live.")
+    """
+    Load ALL heavy resources ONCE at server startup.
+    Every user gets zero cold-start delay.
+    Order: embeddings first → then Pinecone (needs embedding dimension).
+    """
+    print("🚀 Server starting up...")
+    app_state.load_embeddings()   # HuggingFace ~90MB — loaded once, shared across all requests
+    app_state.load_pinecone()     # Pinecone cloud index — connected once, persistent
+    print("✅ All resources ready. Server is live.")
     yield
-    # Shutdown cleanup
     print("🛑 Shutting down. Clearing state.")
     app_state.clear()
 
 # ─────────────────────────────────────────
-# Rate Limiter — mirrors Gemini free tier
+# Rate Limiter — mirrors Gemini free tier (60 req/min)
 # ─────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
 
@@ -54,7 +58,7 @@ limiter = Limiter(key_func=get_remote_address)
 # ─────────────────────────────────────────
 app = FastAPI(
     title="RAG AI Assistant",
-    description="Production-grade RAG backend with FastAPI, FAISS, and Gemini",
+    description="Production-grade RAG backend with FastAPI, Pinecone, LangChain and Gemini",
     version="2.0.0",
     lifespan=lifespan
 )
@@ -73,7 +77,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 # ─────────────────────────────────────────
-# Root — serves frontend
+# Root — serves frontend UI
 # ─────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
@@ -87,7 +91,8 @@ async def health():
     return {
         "status": "ok",
         "embedding_model": "loaded" if app_state.embeddings else "not loaded",
-        "faiss_index": "loaded" if app_state.faiss_index else "not loaded"
+        "pinecone": "connected" if app_state.pinecone_index else "not connected",
+        "google_api": "configured" if app_state.embeddings else "not configured"
     }
 
 # ─────────────────────────────────────────
@@ -95,7 +100,7 @@ async def health():
 # ─────────────────────────────────────────
 @app.post("/session/create", response_model=SessionCreateResponse)
 async def create_session():
-    """Each user gets a unique session ID to isolate their chat history."""
+    """Each user gets a unique UUID session — isolates chat history completely."""
     session_id = session_manager.create_session()
     return SessionCreateResponse(session_id=session_id)
 
@@ -118,30 +123,27 @@ async def delete_session(session_id: str):
 @limiter.limit("10/minute")
 async def upload_documents(request: Request, files: list[UploadFile] = File(...)):
     """
-    Process uploaded PDF/TXT/DOCX files.
-    Builds FAISS index from extracted text — stored in app_state (shared, in-memory).
+    Upload PDF/TXT/DOCX → extract text → chunk → embed → upsert to Pinecone.
+    Heavy work offloaded to thread pool — non-blocking for other users.
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
     await process_uploaded_files(files)
-    return {"message": f"✅ {len(files)} file(s) processed and indexed successfully"}
+    return {"message": f"✅ {len(files)} file(s) processed and indexed to Pinecone successfully"}
 
 
 @app.post("/documents/ask", response_model=QuestionResponse)
 @limiter.limit("60/minute")
 async def ask_document(request: Request, body: QuestionRequest):
     """
-    Stateless FAISS similarity search + Gemini LLM call.
-    Read-only on shared index — safe for concurrent requests.
+    Embed question → Pinecone similarity search → Gemini answer.
+    Pinecone search is stateless and read-only — safe for concurrent requests.
     """
-    if not app_state.faiss_index:
-        raise HTTPException(status_code=400, detail="No documents uploaded yet. Please upload files first.")
+    if not app_state.pinecone_index:
+        raise HTTPException(status_code=400, detail="Pinecone not connected. Check PINE_CONE_API_KEY.")
 
     answer = await answer_from_documents(body.question)
-
-    # Save to session history
     session_manager.append_history(body.session_id, body.question, answer)
-
     return QuestionResponse(answer=answer)
 
 
@@ -151,7 +153,7 @@ async def ask_document(request: Request, body: QuestionRequest):
 @app.post("/summarize", response_model=SummarizeResponse)
 @limiter.limit("60/minute")
 async def summarize(request: Request, body: SummarizeRequest):
-    """Summarize any given text using Gemini."""
+    """Summarize any given text using Gemini 2.5 Flash."""
     summary = await summarize_text(body.text)
     session_manager.append_history(body.session_id, body.text[:100] + "...", summary)
     return SummarizeResponse(summary=summary)
