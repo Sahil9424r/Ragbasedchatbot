@@ -1,27 +1,31 @@
 """
 app/services.py
 
-Core business logic — async versions of your original Streamlit functions.
+All business logic — async. FAISS completely replaced with Pinecone.
 
-Key changes from Streamlit version:
-  1. All functions are async — FastAPI's event loop handles concurrency
-  2. Embedding model loaded from app_state (not reloaded per request)
-  3. FAISS index stored in app_state (not reloaded from disk per request)
-  4. LangChain calls wrapped with asyncio.run_in_executor where needed
-     (LangChain is sync — we offload to thread pool to avoid blocking event loop)
+Flow:
+  Upload  → extract text → chunk → embed → upsert to Pinecone cloud
+  Ask     → embed question → Pinecone similarity search → Gemini answer
+
+Where FAISS was used (OLD):              Where Pinecone is used (NEW):
+  _build_faiss_index()              →      _upsert_to_pinecone()
+  app_state.faiss_index             →      app_state.pinecone_index
+  faiss_index.similarity_search()   →      pinecone_index.query()
+  saved to disk (faiss_index/)      →      stored in Pinecone cloud
 """
 
 import asyncio
+import uuid
 from io import BytesIO
 from typing import List
 
 from fastapi import UploadFile
-from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document as LCDocument
 from PyPDF2 import PdfReader
 from docx import Document
 
@@ -29,10 +33,13 @@ from app.state import app_state
 
 
 # ─────────────────────────────────────────
-# File Text Extraction (same as your original)
+# STEP 1 — File Text Extraction
 # ─────────────────────────────────────────
 def _extract_text_from_file(file_bytes: bytes, filename: str) -> str:
-    """Extract raw text from PDF, TXT, or DOCX."""
+    """
+    Extract raw text from PDF, TXT, or DOCX.
+    Same logic as your original Streamlit version.
+    """
     ext = filename.split('.')[-1].lower()
     text = ""
 
@@ -52,31 +59,106 @@ def _extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     return text
 
 
+# ─────────────────────────────────────────
+# STEP 2 — Chunking
+# ─────────────────────────────────────────
 def _chunk_text(text: str) -> list:
-    """Split text into overlapping chunks for embedding."""
-    splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+    """
+    Split large text into overlapping chunks.
+    chunk_size=10000, chunk_overlap=1000 — same as your Streamlit version.
+    Each chunk becomes one vector in Pinecone.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=10000,
+        chunk_overlap=1000
+    )
     return splitter.split_text(text)
 
 
-def _build_faiss_index(chunks: list) -> FAISS:
+# ─────────────────────────────────────────
+# STEP 3 — Embed + Upsert to Pinecone
+# (replaces _build_faiss_index)
+# ─────────────────────────────────────────
+def _upsert_to_pinecone(chunks: list):
     """
-    Build FAISS vector store from text chunks.
-    Uses the globally cached embedding model from app_state —
-    no model reload per request.
+    Embed each chunk → upsert vector to Pinecone cloud.
+
+    OLD (FAISS):
+        index = FAISS.from_texts(chunks, embedding=app_state.embeddings)
+        index.save_local("faiss_index")          ← saved to disk, lost on restart
+        app_state.faiss_index = index            ← only in local memory
+
+    NEW (Pinecone):
+        embed each chunk → upsert to Pinecone cloud
+        ← persistent across restarts
+        ← accessible from any server instance
+        ← supports concurrent reads natively
     """
-    return FAISS.from_texts(chunks, embedding=app_state.embeddings)
+    vectors = []
+    for chunk in chunks:
+        vector = app_state.embeddings.embed_query(chunk)  # 384-dim float list
+        vectors.append({
+            "id": str(uuid.uuid4()),          # unique ID per chunk
+            "values": vector,                  # the actual embedding
+            "metadata": {"text": chunk}        # store original text for retrieval
+        })
+
+    # Upsert in batches of 100 (Pinecone recommended)
+    batch_size = 100
+    for i in range(0, len(vectors), batch_size):
+        app_state.pinecone_index.upsert(vectors=vectors[i:i + batch_size])
+
+    print(f"  ✅ Upserted {len(vectors)} vectors to Pinecone.")
 
 
 # ─────────────────────────────────────────
-# Document Processing
+# STEP 4 — Similarity Search from Pinecone
+# (replaces faiss_index.similarity_search)
+# ─────────────────────────────────────────
+def _search_pinecone(question: str, top_k: int = 4) -> list:
+    """
+    Embed the question → query Pinecone → return top-k matching chunks.
+
+    OLD (FAISS):
+        docs = app_state.faiss_index.similarity_search(question)
+        ← reads from local memory / disk
+
+    NEW (Pinecone):
+        query_vector = embed(question)
+        results = pinecone_index.query(vector=query_vector, top_k=4)
+        ← reads from Pinecone cloud
+        ← stateless, concurrent-safe, no disk I/O
+    """
+    # Embed the user's question
+    query_vector = app_state.embeddings.embed_query(question)
+
+    # Query Pinecone for top-k similar vectors
+    results = app_state.pinecone_index.query(
+        vector=query_vector,
+        top_k=top_k,
+        include_metadata=True    # need metadata to get original text back
+    )
+
+    # Convert Pinecone results → LangChain Document objects
+    # (QA chain expects LangChain Documents)
+    docs = [
+        LCDocument(page_content=match["metadata"]["text"])
+        for match in results["matches"]
+        if "text" in match.get("metadata", {})
+    ]
+    return docs
+
+
+# ─────────────────────────────────────────
+# Document Processing (Upload Handler)
 # ─────────────────────────────────────────
 async def process_uploaded_files(files: List[UploadFile]):
     """
-    Read uploaded files, extract text, build FAISS index.
-    Stores result in app_state.faiss_index (shared, in-memory).
+    Full pipeline:
+    Read files → extract text → chunk → embed → upsert to Pinecone
 
-    Heavy CPU work (FAISS build) is offloaded to thread pool
-    so it doesn't block the async event loop.
+    run_in_executor: offloads CPU-bound embedding work to thread pool
+    so it doesn't block the async event loop for other users.
     """
     raw_text = ""
     for file in files:
@@ -85,11 +167,8 @@ async def process_uploaded_files(files: List[UploadFile]):
 
     chunks = _chunk_text(raw_text)
 
-    # Offload CPU-bound FAISS build to thread pool
     loop = asyncio.get_event_loop()
-    index = await loop.run_in_executor(None, _build_faiss_index, chunks)
-
-    app_state.set_faiss_index(index)
+    await loop.run_in_executor(None, _upsert_to_pinecone, chunks)
 
 
 # ─────────────────────────────────────────
@@ -114,28 +193,29 @@ def _get_qa_chain():
 
 async def answer_from_documents(question: str) -> str:
     """
-    Stateless FAISS similarity search + Gemini LLM call.
-
-    FAISS search is read-only on the shared index — safe for concurrent requests.
-    LangChain chain is created fresh per request (stateless, no shared mutable state).
-    Gemini API call is I/O bound — event loop handles concurrency during await.
+    1. Search Pinecone for relevant chunks
+    2. Pass to Gemini QA chain
+    Both offloaded to thread pool — non-blocking.
     """
     loop = asyncio.get_event_loop()
 
-    # Similarity search — offload to thread pool (FAISS is sync)
+    # Step 1: Pinecone search (replaces faiss_index.similarity_search)
     docs = await loop.run_in_executor(
-        None,
-        lambda: app_state.faiss_index.similarity_search(question)
+        None, lambda: _search_pinecone(question)
     )
 
-    chain = _get_qa_chain()
+    if not docs:
+        return "No relevant content found. Please upload documents first."
 
-    # LangChain chain call — offload to thread pool
+    # Step 2: Gemini answer generation
+    chain = _get_qa_chain()
     response = await loop.run_in_executor(
         None,
-        lambda: chain({"input_documents": docs, "question": question}, return_only_outputs=True)
+        lambda: chain(
+            {"input_documents": docs, "question": question},
+            return_only_outputs=True
+        )
     )
-
     return response["output_text"]
 
 
@@ -157,7 +237,6 @@ def _get_summarize_chain():
 
 
 async def summarize_text(text: str) -> str:
-    """Summarize text — LangChain call offloaded to thread pool."""
     chain = _get_summarize_chain()
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: chain.run(text=text))
@@ -193,7 +272,6 @@ async def career_counseling_response(question: str) -> str:
 def _get_personal_chain():
     prompt_template = """
     You are a friendly, understanding, and supportive AI assistant.
-    A user is asking a personal or emotional question.
     Respond with empathy, encouragement, and practical advice.
 
     Question:
@@ -217,11 +295,8 @@ async def personal_support_response(question: str) -> str:
 # ─────────────────────────────────────────
 def _get_entertainment_chain():
     prompt_template = """
-    You are a friendly, understanding, and supportive AI assistant.
-    A user is asking entertainment related questions about songs, films,
-    web series, TV shows, web shows, short films, recommendations.
-    Also give recommendations about films/shows related to a particular topic or genre.
-    Respond with entertaining, encouraging, and practical advice.
+    You are a friendly AI assistant for entertainment recommendations.
+    Help with movies, shows, songs, web series, and genre-based suggestions.
 
     Question:
     {question}
@@ -244,10 +319,9 @@ async def entertainment_response(question: str) -> str:
 # ─────────────────────────────────────────
 def _get_mcq_chain():
     prompt_template = """
-    You're a helpful educational assistant. From the text below, do the following:
+    You are a helpful educational assistant. From the text below:
 
-    1. Generate 3 multiple choice questions (MCQs) with 4 options each
-       and indicate the correct answer.
+    1. Generate 3 MCQs with 4 options each and indicate the correct answer.
     2. Provide short notes summarizing the key points.
 
     Text:
